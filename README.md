@@ -74,7 +74,7 @@ node plugin/gwproxy.mjs install --gateway-env /path/to/gateway.env
 **As a plugin,** inside Claude Code:
 
 ```
-/plugin marketplace add OWNER/rc-gateway-proxy
+/plugin marketplace add oadirt/rc-gateway-proxy
 /plugin install gwproxy@gwproxy
 /gwproxy:setup /path/to/gateway.env
 ```
@@ -158,4 +158,4 @@ trailers, and replacing the three certificate files as one step.
 
 ## License
 
-None chosen yet.
+MIT. See [LICENSE](LICENSE).

@@ -1,7 +1,10 @@
 {
   "name": "gwproxy",
   "description": "Claude Code through your own gateway, with Remote Control still working",
-  "owner": { "name": "rc-gateway-proxy" },
+  "owner": {
+    "name": "oadirt",
+    "url": "https://github.com/oadirt"
+  },
   "plugins": [
     {
       "name": "gwproxy",
