@@ -138,24 +138,47 @@ at, or older than the plugin's copy. The plugin never runs the proxy itself; the
 
 ## What has and has not been tested
 
-On macOS with Claude Code 2.1.325, in November 2026:
+**Against local stand-ins** (`node test/run.mjs`, 28 checks, about three minutes). The proxy is run
+against a stand-in for `api.anthropic.com` and one for a gateway, and what each of them received
+is checked. It covers every rule in the table above; that the login never reaches the gateway and
+the gateway key never reaches Anthropic, across the whole run; gzip, streaming, keep-alive,
+requests written back to back, `Expect: 100-continue`, bodiless responses; a 200 MB upload and a
+200 MB download without the proxy holding them in memory; an upgraded (WebSocket-style) connection
+carrying bytes both ways; an event stream held open for 150 seconds; 200 requests at once; a client
+that goes away; a response dropped half way; oversized and undecodable bodies; malformed tunnel
+requests; and the gateway being down. Six faults planted in the proxy one at a time (login sent to
+the gateway, unlisted paths passed on, no tripwire, no thread refusal, upgrades allowed anywhere,
+gateway cookies kept) were each caught.
 
-- Each rule in the table above, through `curl`, including gzip bodies and streaming.
-- `claude -p` with a tool call; `claude remote-control` with prompts sent to its session; a session
-  started from the new-session page at claude.ai/code that ran in the server's folder. Model calls
-  were matched one for one against the gateway's own records.
-- With the proxy stopped, `claude -p` gave no answer and nothing reached the gateway or ran
-  elsewhere in the 30 seconds it was watched.
-- `install` and `uninstall` on an empty home folder, and the plugin loaded for one session.
+The test listens on port 443 on this machine, because the proxy always connects to
+`api.anthropic.com` on that port; macOS allows that without root. Nothing leaves the machine.
 
-Not tested: a real WebSocket session (only the handshake relay), the phone app, attachments,
-approval prompts, sessions lasting hours, installing the plugin from a marketplace, how Claude Code
-displays the session-start check's message, and anything on Linux or Windows.
+**With Claude Code itself** (macOS, Claude Code 2.1.325, November 2026), against a real gateway:
 
-One independent read-only review was done; its main finding (unknown requests used to go to
-Anthropic) led to the refuse-by-default rule above. The changes made after it have not been
-reviewed. Not taken from it: a proxy password, a header allowlist for the gateway, forwarding
-trailers, and replacing the three certificate files as one step.
+- `claude -p` with a tool call, and `claude remote-control` with prompts sent to its session. Model
+  calls were matched one for one against the gateway's own records.
+- From claude.ai/code in a browser: a session started from the new-session page ran in the server's
+  folder; an approval prompt answered with "Allow once" let the command run; a file attached to a
+  message was fetched by Claude Code and read.
+- With the proxy stopped, `claude -p` gave no answer and nothing reached the gateway in the 30
+  seconds it was watched.
+- `install` and `uninstall` on an empty home folder. The plugin installed from a marketplace added
+  by local path: its three commands, `/gwproxy:setup` with and without a file, and the
+  session-start message as an interactive session shows it.
+
+**Not tested:** the phone and desktop apps; a real WebSocket session from a Claude app (only the
+stand-in's); sessions lasting hours (the longest stream was 150 seconds; the longest the proxy has
+run in ordinary use is a couple of hours); a marketplace added from a git URL; anything on Linux
+or Windows.
+
+**Known gap.** Claude Code has features on `/v1/...` paths outside the pass list, and they get a
+404 here. One seen in ordinary use is `/v1/ultrareview` (a quota lookup). See `status` for what
+your own use runs into.
+
+One independent read-only review was done before the tests above existed; its main finding (unknown
+requests used to go to Anthropic) led to the refuse-by-default rule. The changes made after it have
+not been reviewed. Not taken from it: a proxy password, a header allowlist for the gateway,
+forwarding trailers, and replacing the three certificate files as one step.
 
 ## Prior art
 
