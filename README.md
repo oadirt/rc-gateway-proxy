@@ -16,6 +16,7 @@ plugin marketplace with one plugin that installs and checks it.
   combination anyway, by leaving that setting alone and redirecting model calls at the network
   layer. That is not a supported configuration. The account you are signed in with is the one
   exposed if Anthropic objects, and a Claude Code update can stop it working at any time.
+  The technique is not new: see [Prior art](#prior-art).
 - **It reads your Claude sign-in token.** To tell model calls from everything else, it decrypts
   Claude Code's traffic to `api.anthropic.com` on your own machine, using a certificate authority
   it creates locally and that only Claude Code is told to trust. Read the code before you run it.
@@ -155,6 +156,40 @@ One independent read-only review was done; its main finding (unknown requests us
 Anthropic) led to the refuse-by-default rule above. The changes made after it have not been
 reviewed. Not taken from it: a proxy password, a header allowlist for the gateway, forwarding
 trailers, and replacing the three certificate files as one step.
+
+## Prior art
+
+Putting a local TLS-intercepting proxy in front of Claude Code, with `ANTHROPIC_BASE_URL` left
+unset so that Remote Control stays on, is an established approach. This project is a small,
+single-purpose take on it.
+
+- [teamclaude](https://github.com/KarpelesLab/teamclaude) pools several accounts and backends
+  behind one proxy. Its default mode is the same kind of forward proxy with a local CA, it passes
+  the Remote Control paths through with the client's own login, and it can send model calls to a
+  third-party Anthropic-compatible backend. See its
+  [proxy modes](https://github.com/KarpelesLab/teamclaude/blob/master/docs/proxy-modes.md).
+- [claude-code-cache-fix](https://github.com/cnighswonger/claude-code-cache-fix/releases/tag/v4.3.0)
+  added an opt-in forward-proxy mode in 4.3.0, described as "Remote Control through the proxy".
+- [A mitmproxy recipe](https://gist.github.com/foxy82/10eae1bbf5683a680e9f20a45b6ea6c5) routes
+  `/v1/messages` to a local compression proxy and passes everything else through, to keep Remote
+  Control working.
+- [How to get Remote Control back in Claude Code when you run through a proxy](https://apfelbaum.io/remote-control-claude-code/)
+  describes the problem and the fix that went into teamclaude.
+
+The two settings this relies on are documented by Anthropic for networks that inspect TLS:
+[Enterprise network configuration](https://code.claude.com/docs/en/network-config) covers
+`HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS`.
+
+What Anthropic has not agreed to is the result. The
+[Remote Control requirements](https://code.claude.com/docs/en/remote-control#requirements) list a
+gateway as unsupported, a request to allow it behind a transparent proxy was
+[closed as not planned](https://github.com/anthropics/claude-code/issues/72749), and a request for
+a second provider beside the subscription is
+[still open](https://github.com/anthropics/claude-code/issues/95744). That others do this is
+precedent, not permission.
+
+Where this project differs from the ones above: it does one thing, in one file with no
+dependencies, and it refuses whatever it does not recognise.
 
 ## License
 
