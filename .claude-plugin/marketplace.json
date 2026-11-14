@@ -1,0 +1,12 @@
+{
+  "name": "gwproxy",
+  "description": "Claude Code through your own gateway, with Remote Control still working",
+  "owner": { "name": "rc-gateway-proxy" },
+  "plugins": [
+    {
+      "name": "gwproxy",
+      "source": "./plugin",
+      "description": "Installs and checks a local proxy that sends Claude Code's model calls to your own gateway"
+    }
+  ]
+}
