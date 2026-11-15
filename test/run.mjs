@@ -41,12 +41,13 @@ const standInTls = { key: fs.readFileSync(f('leaf.key')), cert: fs.readFileSync(
 
 // --- the stand-ins. Each keeps a record of every request it received.
 const seen = { anthropic: [], gateway: [] };
+let directPhase = false;   // set while the direct-mode checks run; model calls may reach Anthropic only then
 const closed = new Set();
 const readAll = (req) => new Promise((resolve) => { const c = []; req.on('data', (d) => c.push(d)).on('end', () => resolve(Buffer.concat(c))); });
 function record(side, req, body) {
   let modelShaped = false;
   try { const j = JSON.parse(body); modelShaped = typeof j.model === 'string' && (Array.isArray(j.messages) || 'prompt' in j); } catch { /* not JSON */ }
-  seen[side].push({ method: req.method, url: req.url, headers: req.headers, modelShaped });
+  seen[side].push({ method: req.method, url: req.url, headers: req.headers, modelShaped, directPhase });
 }
 
 const anthropic = https.createServer(standInTls, async (req, res) => {
@@ -71,6 +72,7 @@ const anthropic = https.createServer(standInTls, async (req, res) => {
     for (let i = 0; i < mb; i++) if (!res.write(block)) await new Promise((r) => res.once('drain', r));
     return res.end();
   }
+  if (url.pathname.startsWith('/v1/messages')) return res.end(JSON.stringify({ direct: true, authorization: req.headers.authorization || null, encoding: req.headers['content-encoding'] || null, sha256: sha(body) }));
   if (url.pathname === '/api/status') { res.writeHead(Number(url.searchParams.get('code'))); return res.end(); }
   if (url.pathname === '/api/headers') { res.writeHead(200, { 'set-cookie': 'kept=1', connection: 'keep-alive, x-one-hop', 'x-one-hop': 'secret', 'x-end-to-end': 'yes' }); return res.end('{}'); }
   if (url.pathname === '/api/reset') { res.writeHead(200, { 'content-type': 'text/plain' }); res.write('partial'); await sleep(100); return req.socket.destroy(); }
@@ -317,6 +319,95 @@ await check('200 requests at once, model calls and pass-list calls mixed, each a
     : call({ path: `/api/ping?n=${i}`, useAgent: many }).then((r) => r.json.path === `/api/ping?n=${i}` && r.json.authorization === LOGIN))));
   assert.equal(out.filter(Boolean).length, 200); many.destroy();
 });
+// --- the mode switch
+const gw = (...a) => spawnSync(process.execPath, [script, ...a], { env, encoding: 'utf8' });
+const modeFile = path.join(home, 'mode');
+const promptHook = (prompt, e = env) => spawnSync(process.execPath, [script, 'prompt-hook'], { env: e, encoding: 'utf8', input: typeof prompt === 'string' ? json({ session_id: 's', hook_event_name: 'UserPromptSubmit', prompt }) : prompt.raw });
+const health = async () => JSON.parse(await new Promise((r) => http.get(`http://127.0.0.1:${proxyPort}/gwproxy/health`, (res) => { let s = ''; res.on('data', (d) => { s += d; }); res.on('end', () => r(s)); })));
+const sameConn = new ThroughProxy({ keepAlive: true, maxSockets: 1 });
+const goesTo = async (extra = {}) => {
+  const g = seen.gateway.length; const a = seen.anthropic.length;
+  const r = await call({ method: 'POST', path: '/v1/messages', headers: J, body: modelBody(extra), useAgent: sameConn });
+  const to = seen.gateway.length > g ? 'gateway' : seen.anthropic.length > a ? 'anthropic' : 'neither';
+  return { to, r };
+};
+
+await check('mode: with no mode file, model calls go to the gateway and health says so', async () => {
+  assert.equal(fs.existsSync(modeFile), false); assert.equal((await health()).mode, 'gateway');
+  assert.equal((await goesTo()).to, 'gateway');
+  const out = gw('mode'); assert.equal(out.status, 0, out.stderr); assert.match(out.stdout, /mode is gateway/);
+});
+await check('mode direct: the next model call, on the same connection, goes to Anthropic unchanged with the login', async () => {
+  directPhase = true;
+  const out = gw('mode', 'direct'); assert.equal(out.status, 0, out.stderr); assert.match(out.stdout, /switched to direct mode/); assert.doesNotMatch(out.stdout, /warning/);
+  assert.equal((await health()).mode, 'direct');
+  const { to, r } = await goesTo(); assert.equal(to, 'anthropic');
+  assert.equal(r.json.authorization, LOGIN); assert.equal(seen.anthropic.at(-1).headers.cookie, 'session=client-cookie');
+  assert.ok(!JSON.stringify(seen.anthropic.at(-1).headers).includes(GATEWAY_KEY));
+  const { gzipSync } = await import('node:zlib'); const gz = gzipSync(Buffer.from(modelBody()));
+  const z = await call({ method: 'POST', path: '/v1/messages', headers: { ...J, 'content-encoding': 'gzip' }, body: gz, useAgent: sameConn });
+  assert.equal(z.json.encoding, 'gzip'); assert.equal(z.json.sha256, sha(gz), 'the body was changed on the way');
+  const t = await goesTo({ thread: { type: 'continue' } }); assert.equal(t.to, 'anthropic', 'a thread continue was not passed on in direct mode');
+  assert.equal((await call({ method: 'POST', path: '/v1/messages/count_tokens', headers: J, body: modelBody(), useAgent: sameConn })).json.direct, true);
+});
+await check('mode direct: unlisted paths and the tripwire still refuse', async () => {
+  const before = [seen.gateway.length, seen.anthropic.length];
+  assert.equal((await call({ method: 'POST', path: '/v1/something_new', headers: J, body: modelBody() })).status, 404);
+  assert.equal((await call({ method: 'POST', path: '/api/ping', headers: J, body: modelBody() })).status, 403);
+  assert.deepEqual([seen.gateway.length, seen.anthropic.length], before);
+});
+await check('mode gateway again: the next model call on the same connection goes to the gateway with the gateway key', async () => {
+  const out = gw('mode', 'gateway'); assert.match(out.stdout, /switched to gateway mode/);
+  directPhase = false;
+  const { to } = await goesTo(); assert.equal(to, 'gateway'); assert.equal(seen.gateway.at(-1).headers.authorization, `Bearer ${GATEWAY_KEY}`);
+  assert.equal((await goesTo({ thread: { type: 'continue' } })).to, 'neither', 'a thread continue was not refused in gateway mode');
+});
+await check('a mode file that is unreadable, unknown or removed means gateway, even right after direct', async () => {
+  for (const spoil of [() => fs.chmodSync(modeFile, 0), () => fs.writeFileSync(modeFile, 'banana\n'), () => fs.writeFileSync(modeFile, ''), () => fs.rmSync(modeFile)]) {
+    directPhase = true; gw('mode', 'direct'); assert.equal((await goesTo()).to, 'anthropic');
+    spoil(); directPhase = false;
+    assert.equal((await goesTo()).to, 'gateway', `still direct after ${spoil}`);
+  }
+  gw('mode', 'gateway'); assert.equal(fs.readFileSync(modeFile, 'utf8'), 'gateway\n');
+});
+await check('a request in flight when the mode changes finishes where it started', async () => {
+  const p = call({ method: 'POST', path: '/v1/messages', headers: J, body: modelBody({ stream: true }), useAgent: new ThroughProxy() });
+  await sleep(200); directPhase = true; gw('mode', 'direct');
+  const r = await p; assert.equal(r.status, 200); assert.ok(r.body.toString().includes('"i":4'), 'the stream from the gateway was cut');
+  gw('mode', 'gateway'); directPhase = false;
+});
+await check('prompt hook: /gwproxy:off, /gwproxy:on and /gwproxy:mode switch or show, and are blocked', async () => {
+  for (const [line, want] of [['/gwproxy:off', 'direct'], ['  /gwproxy:mode  ', 'direct'], ['/gwproxy:on\n', 'gateway']]) {
+    const r = promptHook(line); assert.equal(r.status, 0, r.stderr);
+    const o = JSON.parse(r.stdout); assert.equal(o.decision, 'block'); assert.equal(o.hookSpecificOutput.suppressOriginalPrompt, true);
+    assert.match(o.reason, new RegExp(`(${want} mode|mode is ${want})`), r.stdout + r.stderr); assert.equal((await health()).mode, want);
+  }
+});
+await check('prompt hook: every other prompt passes untouched, quickly, and bad input never blocks', async () => {
+  for (const p of ['hello', '/gwproxy:status', 'please run /gwproxy:off', '/gwproxy:offline', '/gwproxy:on now', { raw: 'not json gwproxy:' }, { raw: '' }]) {
+    const t0 = Date.now(); const r = promptHook(p);
+    assert.equal(r.status, 0, `${JSON.stringify(p)}: ${r.stderr}`); assert.equal(r.stdout, '', `${JSON.stringify(p)} was answered`);
+    assert.ok(Date.now() - t0 < 2000, `${JSON.stringify(p)} took ${Date.now() - t0} ms`);
+  }
+  assert.equal((await health()).mode, 'gateway');
+});
+await check('prompt hook: with no setup, or a broken config.json, it still blocks and says why', async () => {
+  const bad = f('bad-home'); fs.mkdirSync(bad);
+  for (const write of [() => {}, () => fs.writeFileSync(path.join(bad, 'config.json'), '{ not json')]) {
+    write(); const r = promptHook('/gwproxy:off', { ...env, GWPROXY_HOME: bad });
+    assert.equal(r.status, 0, r.stderr); const o = JSON.parse(r.stdout); assert.equal(o.decision, 'block'); assert.match(o.reason, /not set up|unreadable/);
+  }
+});
+await check('mode: a running proxy that predates modes is reported, not trusted', async () => {
+  const old = http.createServer((_q, s) => s.end(json({ ok: true, pid: 1, gatewayHost: 'x' }))); const oldHome = f('old-home');
+  const port = await listen(old, 0, '127.0.0.1'); fs.mkdirSync(oldHome); fs.writeFileSync(path.join(oldHome, 'config.json'), json({ port }));
+  // Not spawnSync: the stand-in old proxy runs in this process and must be able to answer.
+  const out = await new Promise((resolve) => { const c = spawn(process.execPath, [script, 'mode', 'direct'], { env: { ...env, GWPROXY_HOME: oldHome } }); let stdout = '', stderr = ''; c.stdout.on('data', (d) => { stdout += d; }); c.stderr.on('data', (d) => { stderr += d; }); c.on('close', (status) => resolve({ status, stdout, stderr })); });
+  old.close(); assert.equal(out.status, 0, out.stderr); assert.match(out.stdout, /predates modes/);
+  const bad = spawnSync(process.execPath, [script, 'mode', 'sideways'], { env, encoding: 'utf8' }); assert.notEqual(bad.status, 0);
+});
+sameConn.destroy();
+
 await check('with the gateway gone, a model call fails at the proxy and nothing goes to Anthropic', async () => {
   await new Promise((r) => { gateway.close(r); gateway.closeAllConnections(); });
   const before = seen.anthropic.length;
@@ -337,7 +428,11 @@ await check('across the whole run: the login never reached the gateway', async (
   assert.ok(seen.gateway.length > 100);
 });
 await check('across the whole run: the gateway key never reached Anthropic, and no model call did', async () => {
-  for (const a of seen.anthropic) { assert.ok(!JSON.stringify(a.headers).includes(GATEWAY_KEY)); assert.equal(a.modelShaped, false, `${a.method} ${a.url}`); assert.ok(!a.url.startsWith('/v1/messages')); }
+  for (const a of seen.anthropic) {
+    assert.ok(!JSON.stringify(a.headers).includes(GATEWAY_KEY));
+    if (a.directPhase && a.url.startsWith('/v1/messages')) continue;   // direct mode, asked for
+    assert.equal(a.modelShaped, false, `${a.method} ${a.url}`); assert.ok(!a.url.startsWith('/v1/messages'), `${a.url} outside direct mode`);
+  }
   assert.ok(seen.anthropic.length > 100);
 });
 await check('the proxy is still running, and its log has no crash and no key or login in it', async () => {

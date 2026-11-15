@@ -9,12 +9,18 @@
 //   api.anthropic.com   any other path               -> refused here with 404, and logged as "unlisted"
 //   any other host                                   -> tunnelled, never read
 //
+// In direct mode (the file "mode" in the gwproxy folder says "direct"), /v1/messages goes to
+// api.anthropic.com unchanged instead, on the user's own plan. The mode is read per request, so a
+// switch reaches running sessions at their next model call. No file, or anything else in it: gateway.
+//
 // The pass list is what Claude Code needs to sign in, to load its configuration and to run Remote
 // Control. Anything not on it never reaches Anthropic, so a model call on a path this file has not
 // heard of fails here instead of running on the account.
 //
 // Commands: install and uninstall do everything; setup, service, settings are their steps; serve is
-// the proxy; status and hook report on it. No dependencies. openssl is called once, for the certificates.
+// the proxy; status and hook report on it; mode switches between gateway and direct, and
+// prompt-hook does that for /gwproxy:on and /gwproxy:off without a model call. No dependencies.
+// openssl is called once, for the certificates.
 // The login service is launchd on macOS and a systemd user unit on Linux.
 import http from 'node:http';
 import https from 'node:https';
@@ -32,7 +38,7 @@ const ANTHROPIC = 'api.anthropic.com';
 const HOME = process.env.GWPROXY_HOME || path.join(os.homedir(), '.config', 'gwproxy');
 // A second copy, kept in another folder, is a service of its own.
 const LABEL = process.env.GWPROXY_HOME ? `local.gwproxy.${crypto.createHash('sha256').update(HOME).digest('hex').slice(0, 8)}` : 'local.gwproxy';
-const P = { config: path.join(HOME, 'config.json'), ca: path.join(HOME, 'ca.pem'), leaf: path.join(HOME, 'leaf.pem'), key: path.join(HOME, 'leaf.key') };
+const P = { config: path.join(HOME, 'config.json'), ca: path.join(HOME, 'ca.pem'), leaf: path.join(HOME, 'leaf.pem'), key: path.join(HOME, 'leaf.key'), mode: path.join(HOME, 'mode') };
 const BODY_CAP = 32 * 1024 * 1024;      // largest body read here, as sent: a model call, or JSON on its way to Anthropic
 const DECODED_CAP = 64 * 1024 * 1024;   // and once decompressed
 const CONNECT_MS = 30_000;              // to reach the other side
@@ -55,6 +61,17 @@ function classify(url, passPrefixes) {
   if (under(low, GATEWAY_PREFIXES)) return { route: 'gateway', path: p, low };
   if (under(low, passPrefixes)) return { route: 'pass', path: p, low };
   return { route: 'unlisted', path: p, low };
+}
+
+// gateway or direct. Anything but a readable "direct" is gateway.
+function readMode() {
+  try { return fs.readFileSync(P.mode, 'utf8').trim() === 'direct' ? 'direct' : 'gateway'; } catch { return 'gateway'; }
+}
+function writeMode(mode) {
+  fs.mkdirSync(HOME, { recursive: true, mode: 0o700 });
+  const tmp = `${P.mode}.tmp${process.pid}`;
+  fs.writeFileSync(tmp, `${mode}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, P.mode);
 }
 
 function readConfig() {
@@ -135,13 +152,21 @@ function serve() {
   } catch { die('no certificates; run: gwproxy.mjs setup'); }
   const gwPrefix = gw.url.pathname.replace(/\/+$/, '');
   const agents = { gateway: new https.Agent({ keepAlive: true }), anthropic: new https.Agent({ keepAlive: true }) };
-  const stats = { started: new Date().toISOString(), gateway: 0, anthropic: 0, refused: 0, unlisted: 0, threadRefused: 0, tunnels: 0, upgrades: 0, errors: 0 };
+  agents.direct = agents.anthropic;
+  const stats = { started: new Date().toISOString(), gateway: 0, direct: 0, anthropic: 0, refused: 0, unlisted: 0, threadRefused: 0, tunnels: 0, upgrades: 0, errors: 0 };
   const unlistedFamilies = new Map();   // path family -> times refused, so a missing pass-list entry can be seen
   const tunnelHosts = new Map();        // host -> tunnels opened
   const count = (map, key) => { if (map.has(key) || map.size < 500) map.set(key, (map.get(key) || 0) + 1); };
   const note = (tag, text) => console.log(`${new Date().toISOString()} ${tag.padEnd(9)} ${text}`);
   // One line per request to Anthropic's host: no headers, no bodies, no query strings.
   const log = (route, req, status, started) => note(route, `${req.method} ${pathOf(req.url)} ${status} ${Date.now() - started}ms`);
+  // The mode, read from its file every time: a tiny read next to a model call. A switch is logged.
+  let lastMode = null;
+  const mode = () => {
+    const m = readMode();
+    if (m !== lastMode) note('mode', `model calls go to ${m === 'direct' ? `${ANTHROPIC} (direct, your own plan)` : gw.url.host}`);
+    return (lastMode = m);
+  };
   const refuse = (req, res, started, status, type, message, close = false) => { stats.refused++; log('refused', req, status, started); sendError(res, status, type, message, undefined, close); };
 
   const copyHeaders = (req, drop = []) => {
@@ -184,6 +209,11 @@ function serve() {
   }
 
   async function modelCall(req, res, p, started) {
+    // Direct: to Anthropic as sent, login and all, streamed without being read.
+    if (mode() === 'direct') {
+      stats.direct++;
+      return relay({ req, res, route: 'direct', host: ANTHROPIC, port: 443, urlPath: req.url, headers: copyHeaders(req), body: null, started });
+    }
     const sent = await readBody(req);
     if (!sent) return refuse(req, res, started, 413, 'request_too_large', 'gwproxy: request body too large', true);
     let body;
@@ -263,7 +293,7 @@ function serve() {
   const outer = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/gwproxy/health') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true, pid: process.pid, gatewayHost: gw.url.host, certificateEnds: leafEnds.toISOString(), ...stats, unlistedFamilies: Object.fromEntries(unlistedFamilies), tunnelHosts: Object.fromEntries(tunnelHosts) }));
+      return res.end(JSON.stringify({ ok: true, pid: process.pid, mode: mode(), gatewayHost: gw.url.host, certificateEnds: leafEnds.toISOString(), ...stats, unlistedFamilies: Object.fromEntries(unlistedFamilies), tunnelHosts: Object.fromEntries(tunnelHosts) }));
     }
     res.writeHead(400, { 'content-type': 'text/plain' }); res.end('gwproxy is an HTTPS forward proxy; set HTTPS_PROXY to this address\n');
   });
@@ -301,9 +331,10 @@ function serve() {
   outer.on('clientError', (_e, sock) => sock.destroy());
   outer.on('error', (e) => die(`cannot listen on 127.0.0.1:${cfg.port}: ${e.code || e.message}`));
   outer.listen(cfg.port, '127.0.0.1', () => {
-    note('gwproxy', `listening on 127.0.0.1:${cfg.port}; model calls go to ${gw.url.host}; certificate ends ${leafEnds.toISOString().slice(0, 10)}`);
+    note('gwproxy', `listening on 127.0.0.1:${cfg.port}; certificate ends ${leafEnds.toISOString().slice(0, 10)}`);
     const days = Math.floor((leafEnds - Date.now()) / 86_400_000);
     if (days < 30) note('WARNING', `the certificate ends in ${days} days; run: gwproxy.mjs setup --renew, then gwproxy.mjs service install, then restart Claude Code sessions`);
+    mode();   // logs where model calls go
   });
   process.on('uncaughtException', (e) => { note('FATAL', e.stack || e); process.exit(1); });
   for (const s of ['SIGTERM', 'SIGINT']) process.on(s, () => process.exit(0));
@@ -501,12 +532,54 @@ async function status() {
   const h = await health(cfg.port);
   if (!h) { console.log(`proxy:    not answering on 127.0.0.1:${cfg.port}`); process.exitCode = 1; return; }
   console.log(`proxy:    running, pid ${h.pid}, since ${h.started}, gateway ${h.gatewayHost}`);
-  console.log(`requests: ${h.gateway} to the gateway, ${h.anthropic} to Anthropic, ${h.unlisted} unlisted, ${h.refused} refused, ${h.threadRefused} thread continues refused, ${h.upgrades} WebSockets, ${h.tunnels} tunnels to other hosts, ${h.errors} errors`);
+  console.log(`mode:     ${modeLine(h)}`);
+  console.log(`requests: ${h.gateway} to the gateway, ${h.direct ?? 0} model calls direct to Anthropic, ${h.anthropic} other to Anthropic, ${h.unlisted} unlisted, ${h.refused} refused, ${h.threadRefused} thread continues refused, ${h.upgrades} WebSockets, ${h.tunnels} tunnels to other hosts, ${h.errors} errors`);
   const fams = Object.entries(h.unlistedFamilies || {});
   if (fams.length) console.log(`unlisted: ${fams.map(([k, n]) => `${k} (${n})`).join(', ')}  <- refused with 404; add to "passPrefixes" in ${P.config} only if it is not a model call`);
   const near = Object.keys(h.tunnelHosts || {}).filter((x) => /(^|\.)(anthropic\.com|claude\.ai|claude\.com|claudeusercontent\.com)$/.test(x));
   if (near.length) console.log(`tunnelled, not read: ${near.join(', ')}`);
   console.log(`certificate ends ${h.certificateEnds.slice(0, 10)}`);
+}
+
+// The mode as the running proxy sees it, in words. A proxy too old to know modes reports none.
+function modeLine(h) {
+  if (!h.mode) return `this proxy predates modes and always uses the gateway; run /gwproxy:setup (or install) to update it`;
+  return h.mode === 'direct' ? `direct: model calls go to ${ANTHROPIC} on your own Claude plan` : `gateway: model calls go to ${h.gatewayHost}`;
+}
+
+// Sets the mode, or shows it. Returns what to tell the user.
+async function setMode(want) {
+  if (want && want !== 'gateway' && want !== 'direct') throw new Error('usage: gwproxy.mjs mode [gateway|direct]');
+  // Not readConfig: that exits, and the prompt hook must always answer, even with an error.
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(P.config, 'utf8')); } catch { throw new Error('not set up on this machine, or its config.json is unreadable; run /gwproxy:setup with your gateway .env file'); }
+  cfg.port ||= 3457;
+  const before = readMode();
+  if (want) writeMode(want);   // always, so a file that could not be read is replaced
+  const now = want || before;
+  const h = await health(cfg.port, 1500);
+  const lines = [];
+  if (!want) lines.push(`mode is ${now}`);
+  else lines.push(want === before ? `already in ${now} mode` : `switched to ${now} mode`);
+  lines.push(now === 'direct' ? `model calls go to ${ANTHROPIC} on your own Claude plan, from the next one on, in every running session` : 'model calls go to the gateway, from the next one on, in every running session');
+  if (!h) lines.push(`warning: the proxy is not answering on 127.0.0.1:${cfg.port}, so model calls fail in either mode; run /gwproxy:status`);
+  else if (!h.mode) lines.push('warning: the running proxy predates modes and ignores this; run /gwproxy:setup to update it');
+  else if (h.mode !== now) lines.push(`warning: the proxy still reports ${h.mode} mode`);
+  else if (!pointedAt(cfg.port)) lines.push('note: Claude Code is not pointed at the proxy, so new sessions use your own plan whatever the mode; run /gwproxy:setup');
+  return lines.join('\n');
+}
+
+// For Claude Code's UserPromptSubmit hook, which sees every prompt as typed. /gwproxy:on, /gwproxy:off
+// and /gwproxy:mode are handled here and blocked, so they never reach a model. Anything else passes
+// untouched, and nothing here ever blocks a prompt by failing.
+async function promptHook() {
+  let prompt;
+  try { prompt = String(JSON.parse(fs.readFileSync(0, 'utf8')).prompt); } catch { return; }
+  const m = /^\s*\/gwproxy:(on|off|mode)\s*$/.exec(prompt);
+  if (!m) return;
+  let reason;
+  try { reason = await setMode({ on: 'gateway', off: 'direct' }[m[1]]); } catch (e) { reason = e.message; }
+  console.log(JSON.stringify({ decision: 'block', reason: `gwproxy: ${reason.replace(/\n/g, '\ngwproxy: ')}`, hookSpecificOutput: { hookEventName: 'UserPromptSubmit', suppressOriginalPrompt: true } }));
 }
 
 // Everything, in order, on a machine that may or may not have it already. The proxy is run from a
@@ -540,6 +613,8 @@ async function install(args) {
   if (changed || !fs.existsSync(servicePath) || !(await health(port))) self('service', 'install');
   else console.log('the proxy is running and nothing changed; left as it is');
   self('settings', 'enable');
+  // Installing means using the gateway: a direct mode left from before is ended.
+  if (readMode() !== 'gateway') { writeMode('gateway'); console.log('mode: back to gateway (it was direct)'); }
   for (let i = 0; i < 20 && !(await health(port, 500)); i++) spawnSync('sleep', ['0.5']);
   self('status');
   console.log(`\ninstalled in ${HOME}. Claude Code sessions started from now on send their model calls to the gateway; ones already running pick it up as well.`);
@@ -558,7 +633,9 @@ async function hook() {
   if (!fs.existsSync(P.config)) return say('not set up on this machine, so this session runs on your own Claude plan. Run /gwproxy:setup with the path of your gateway .env file.');
   const cfg = readConfig(); const installed = path.join(HOME, 'gwproxy.mjs');
   if (!pointedAt(cfg.port)) return say('Claude Code is not pointed at the proxy, so this session runs on your own Claude plan. Run /gwproxy:setup.');
-  if (!(await health(cfg.port, 1500))) return say('the proxy is not answering, so model calls will fail. Run /gwproxy:status.');
+  const h = await health(cfg.port, 1500);
+  if (!h) return say('the proxy is not answering, so model calls will fail. Run /gwproxy:status.');
+  if (h.mode === 'direct') return say('direct mode: model calls go to your own Claude plan, not the gateway. /gwproxy:on switches back.');
   if (scriptPath !== installed && fs.existsSync(installed) && !sameFile(scriptPath, installed)) return say('an update is ready. Run /gwproxy:setup to install it (the proxy restarts, which interrupts running sessions for a few seconds).');
 }
 
@@ -568,7 +645,9 @@ else if (cmd === 'install') await install(rest);
 else if (cmd === 'uninstall') uninstall();
 else if (cmd === 'status') await status();
 else if (cmd === 'hook') await hook();
+else if (cmd === 'prompt-hook') await promptHook();
+else if (cmd === 'mode') { try { console.log(await setMode(rest[0])); } catch (e) { die(e.message); } }
 else if (cmd === 'setup') setup(rest);
 else if (cmd === 'service') service(rest[0]);
 else if (cmd === 'settings') settings(rest[0]);
-else die('usage: gwproxy.mjs install --gateway-env FILE [--port N] | uninstall | status\n  steps: setup --gateway-env FILE [--port N] [--renew] | service install|uninstall | settings enable|disable | serve');
+else die('usage: gwproxy.mjs install --gateway-env FILE [--port N] | uninstall | status | mode [gateway|direct]\n  steps: setup --gateway-env FILE [--port N] [--renew] | service install|uninstall | settings enable|disable | serve');

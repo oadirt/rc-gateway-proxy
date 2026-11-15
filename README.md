@@ -34,7 +34,7 @@ For `api.anthropic.com` the proxy decides per request:
 
 | Request | Goes to |
 |---|---|
-| `/v1/messages` and below (model calls, token counts) | Your gateway, with the gateway key in place of your login |
+| `/v1/messages` and below (model calls, token counts) | Your gateway, with the gateway key in place of your login; in [direct mode](#direct-mode), Anthropic, unchanged |
 | A "continue" of a server-side conversation thread | Refused with Anthropic's own error, so Claude Code resends the conversation in full |
 | A path on the pass list | Anthropic, unchanged, with your own login |
 | The same, with a JSON body that has a `model` and `messages`, `prompt` or `input` | Refused, and logged as `TRIPWIRE` |
@@ -112,6 +112,25 @@ Windows is not supported. WSL counts as Linux.
 | Install, or update after a change | `node gwproxy.mjs install [--gateway-env FILE] [--port N]` | `/gwproxy:setup [FILE]` |
 | See whether it runs and where requests went | `node ~/.config/gwproxy/gwproxy.mjs status` | `/gwproxy:status` |
 | Stop using it | `node ~/.config/gwproxy/gwproxy.mjs uninstall` | `/gwproxy:uninstall` |
+| Model calls to your own plan for now | `node ~/.config/gwproxy/gwproxy.mjs mode direct` | `/gwproxy:off` |
+| Model calls to the gateway again | `node ~/.config/gwproxy/gwproxy.mjs mode gateway` | `/gwproxy:on` |
+| Which of the two | `node ~/.config/gwproxy/gwproxy.mjs mode` | `/gwproxy:mode` |
+
+### Direct mode
+
+`mode direct` (or `/gwproxy:off`) sends `/v1/messages` to `api.anthropic.com` unchanged, with your
+own login, on your own Claude plan. Thread continues are passed on too. Everything else in the table above stays the same. The
+mode lives in `~/.config/gwproxy/mode` and is read on every request, so it applies to every
+Claude Code session of this user, including running ones, from their next model call. A request
+already under way finishes where it started. A missing, unreadable or unrecognised mode file
+means gateway, and `install` sets the mode back to gateway. The first call after a switch does
+not hit the prompt cache of the other side. A session that starts in direct mode is told so.
+
+`/gwproxy:on`, `/gwproxy:off` and `/gwproxy:mode` are handled by the plugin's `UserPromptSubmit`
+hook and blocked before they reach a model, so switching costs no model call. If that hook does not
+run, the commands fall back to asking the model to run `mode`, which is a model call on whichever
+side is active. Typing `! node ~/.config/gwproxy/gwproxy.mjs mode direct` in Claude Code also works
+without a model call. The hook runs on every prompt and passes any other prompt through untouched.
 
 Running `install` again is safe: the proxy is restarted only if something it uses has changed. A
 restart interrupts running sessions for a few seconds; they carry on by themselves.
@@ -151,7 +170,7 @@ does not do this: the settings lines and the service stay.
 
 ## What has and has not been tested
 
-**Against local stand-ins** (`node test/run.mjs`, 28 checks, about three minutes). The proxy is run
+**Against local stand-ins** (`node test/run.mjs`, 38 checks, including the mode switch and the prompt hook, about three minutes). The proxy is run
 against a stand-in for `api.anthropic.com` and one for a gateway, and what each of them received
 is checked. It covers every rule in the table above; that the login never reaches the gateway and
 the gateway key never reaches Anthropic, across the whole run; gzip, streaming, keep-alive,
@@ -165,8 +184,9 @@ gateway cookies kept) were each caught.
 
 The test listens on port 443 on this machine, because the proxy always connects to
 `api.anthropic.com` on that port. macOS allows that without root; on Linux it needs root or
-`net.ipv4.ip_unprivileged_port_start` at 443 or lower. Nothing leaves the machine. All 28 pass on
-macOS and on Ubuntu 24.04.
+`net.ipv4.ip_unprivileged_port_start` at 443 or lower. Nothing leaves the machine. All 38 pass on
+macOS. The 28 checks from before the mode switch also pass on Ubuntu 24.04; the ten mode checks
+have not been run there yet.
 
 **With Claude Code itself on macOS** (Claude Code 2.1.325, November 2026), against a real gateway:
 

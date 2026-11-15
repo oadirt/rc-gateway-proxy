@@ -7,6 +7,13 @@
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/gwproxy.mjs\" hook", "timeout": 10 }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/gwproxy.mjs\" prompt-hook", "timeout": 10 }
+        ]
+      }
     ]
   }
 }
