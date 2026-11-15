@@ -20,7 +20,7 @@ plugin marketplace with one plugin that installs and checks it.
 - **It reads your Claude sign-in token.** To tell model calls from everything else, it decrypts
   Claude Code's traffic to `api.anthropic.com` on your own machine, using a certificate authority
   it creates locally and that only Claude Code is told to trust. Read the code before you run it.
-- **It is new and lightly tested**: macOS only, one Claude Code version, days of use. See
+- **It is new and lightly tested**: macOS and Linux, two Claude Code versions, days of use. See
   [What has and has not been tested](#what-has-and-has-not-been-tested).
 - Not affiliated with or endorsed by Anthropic.
 
@@ -55,7 +55,7 @@ does not run on your Claude plan. The price is that a Claude Code feature using 
 
 ## Install
 
-You need macOS, Node.js 20 or later, `openssl`, Claude Code signed in to a paid Claude plan
+You need macOS or Linux, Node.js 20 or later, `openssl`, Claude Code signed in to a paid Claude plan
 (`claude auth login`), and a gateway file: a text file with two lines,
 
 ```
@@ -85,8 +85,12 @@ Either way the same things happen, once per machine:
 1. The gateway file and the script are copied into `~/.config/gwproxy/`, and a CA and a
    certificate for `api.anthropic.com` are made there. The CA's private key is deleted as soon as
    the certificate is signed.
-2. A login service, `local.gwproxy`, is registered. It runs the proxy on `127.0.0.1:3457`, starts
-   at each login and is restarted if it stops. Its log is `~/Library/Logs/gwproxy.log`.
+2. A login service is registered. It runs the proxy on `127.0.0.1:3457`, starts at each login and
+   is restarted if it stops.
+   - macOS: a launchd agent, `local.gwproxy`; log in `~/Library/Logs/gwproxy.log`.
+   - Linux: a systemd user unit, `gwproxy.service`; log with `journalctl --user -u gwproxy`. It
+     runs while you are logged in. To keep it running after you log out and start it at boot,
+     run `loginctl enable-linger $USER` once.
 3. The two settings lines are added to `~/.claude/settings.json`, with a backup beside it.
 
 After that a plain `claude`, `claude --remote-control` or `claude remote-control`, in any folder,
@@ -94,6 +98,12 @@ uses the gateway for model calls. There is no wrapper command and nothing to run
 Claude Code session of that user goes through the proxy, including ones already running.
 
 If the proxy is down, model calls fail; they do not fall back to your Claude plan.
+
+Where there is no systemd user session (many containers), `install` makes the configuration and
+certificates and then stops, saying so. Keep `node ~/.config/gwproxy/gwproxy.mjs serve` running by
+whatever means you have, then run `node ~/.config/gwproxy/gwproxy.mjs settings enable`.
+
+Windows is not supported. WSL counts as Linux.
 
 ## Commands
 
@@ -116,7 +126,10 @@ What the plugin adds over the file: `/plugin update` brings a new version, and a
 of each session says so if the proxy is not set up, not answering, not what Claude Code is pointed
 at, or older than the plugin's copy. The plugin never runs the proxy itself; the login service does.
 
-`uninstall` removes the settings lines and the service. It leaves `~/.config/gwproxy/` in place.
+`uninstall` removes the settings lines and the service, and Claude Code then runs on your own
+Claude plan again; restart sessions that were already running. It leaves `~/.config/gwproxy/` in
+place, so `install` with no arguments brings everything back. Disabling the plugin in `/plugin`
+does not do this: the settings lines and the service stay.
 
 ## What to know before relying on it
 
@@ -151,9 +164,11 @@ the gateway, unlisted paths passed on, no tripwire, no thread refusal, upgrades 
 gateway cookies kept) were each caught.
 
 The test listens on port 443 on this machine, because the proxy always connects to
-`api.anthropic.com` on that port; macOS allows that without root. Nothing leaves the machine.
+`api.anthropic.com` on that port. macOS allows that without root; on Linux it needs root or
+`net.ipv4.ip_unprivileged_port_start` at 443 or lower. Nothing leaves the machine. All 28 pass on
+macOS and on Ubuntu 24.04.
 
-**With Claude Code itself** (macOS, Claude Code 2.1.325, November 2026), against a real gateway:
+**With Claude Code itself on macOS** (Claude Code 2.1.325, November 2026), against a real gateway:
 
 - `claude -p` with a tool call, and `claude remote-control` with prompts sent to its session. Model
   calls were matched one for one against the gateway's own records.
@@ -162,14 +177,25 @@ The test listens on port 443 on this machine, because the proxy always connects 
   message was fetched by Claude Code and read.
 - With the proxy stopped, `claude -p` gave no answer and nothing reached the gateway in the 30
   seconds it was watched.
-- `install` and `uninstall` on an empty home folder. The plugin installed from a marketplace added
-  by local path: its three commands, `/gwproxy:setup` with and without a file, and the
+- `install` and `uninstall` on an empty home folder. The plugin installed from this repository on
+  GitHub: its three commands, `/gwproxy:setup` with and without a file, and the
   session-start message as an interactive session shows it.
 
+**On Linux:**
+
+- Ubuntu 24.04 (arm64): `install` with a made-up gateway registered the systemd unit; the proxy
+  passed, refused and tunnelled requests as it should; it was restarted after `kill -9`; after a
+  reboot it was running five seconds after boot, before anyone logged in (lingering was on);
+  `uninstall` and a second `install` with no arguments worked.
+- Debian 12 in a container, with a real Claude sign-in and a real gateway, Claude Code 2.1.322, the
+  proxy started by hand: `claude -p` with a tool call, and `claude remote-control` with a prompt
+  sent to its session. Model calls went to the gateway and nothing was refused.
+- Not done on Linux: the plugin commands, a browser-driven session, x86_64.
+
 **Not tested:** the phone and desktop apps; a real WebSocket session from a Claude app (only the
-stand-in's); sessions lasting hours (the longest stream was 150 seconds; the longest the proxy has
-run in ordinary use is a couple of hours); a marketplace added from a git URL; anything on Linux
-or Windows.
+stand-in's); anything on Windows. The proxy has run for about a day at a stretch in ordinary use
+on one Mac; event streams in that time never lasted more than an hour before Claude Code
+reconnected.
 
 **Known gap.** Claude Code has features on `/v1/...` paths outside the pass list, and they get a
 404 here. One seen in ordinary use is `/v1/ultrareview` (a quota lookup). See `status` for what

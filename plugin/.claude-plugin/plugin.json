@@ -1,6 +1,6 @@
 {
   "name": "gwproxy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Installs and checks a local proxy that sends Claude Code's model calls to your own gateway, while Claude Code stays signed in to your own account so Remote Control keeps working",
   "author": {
     "name": "oadirt",

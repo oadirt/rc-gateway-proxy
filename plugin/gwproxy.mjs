@@ -15,6 +15,7 @@
 //
 // Commands: install and uninstall do everything; setup, service, settings are their steps; serve is
 // the proxy; status and hook report on it. No dependencies. openssl is called once, for the certificates.
+// The login service is launchd on macOS and a systemd user unit on Linux.
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
@@ -342,28 +343,41 @@ function setup(args) {
 }
 
 const scriptPath = fileURLToPath(import.meta.url);
-const plistPath = path.join(os.homedir(), 'Library', 'LaunchAgents', `${LABEL}.plist`);
-const logPath = path.join(os.homedir(), 'Library', 'Logs', `${LABEL.slice('local.'.length)}.log`);
+// The login service: launchd on macOS, a systemd user unit on Linux.
+const NAME = LABEL.slice('local.'.length);
+const mac = process.platform === 'darwin';
+const servicePath = mac
+  ? path.join(os.homedir(), 'Library', 'LaunchAgents', `${LABEL}.plist`)
+  : path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'systemd', 'user', `${NAME}.service`);
+const logPath = path.join(os.homedir(), 'Library', 'Logs', `${NAME}.log`);   // macOS; on Linux the log is the user journal
+const run = (cmd, ...args) => spawnSync(cmd, args, { encoding: 'utf8' });
 
 function service(action) {
-  if (process.platform !== 'darwin') die('the service is only written for macOS (launchd) so far');
+  if (!mac && process.platform !== 'linux') die('the service is written for macOS and Linux only; elsewhere keep "gwproxy.mjs serve" running yourself');
   if (action !== 'install' && action !== 'uninstall') die('usage: gwproxy.mjs service install|uninstall');
-  const domain = `gui/${process.getuid()}`;
+  const domain = mac ? `gui/${process.getuid()}` : null;
   if (action === 'uninstall') {
-    spawnSync('launchctl', ['bootout', `${domain}/${LABEL}`], { stdio: 'ignore' });
-    fs.rmSync(plistPath, { force: true }); console.log('service removed'); return;
+    if (mac) run('launchctl', 'bootout', `${domain}/${LABEL}`);
+    else { run('systemctl', '--user', 'disable', '--now', `${NAME}.service`); }
+    fs.rmSync(servicePath, { force: true });
+    if (!mac) run('systemctl', '--user', 'daemon-reload');
+    console.log('service removed'); return;
   }
   // Everything the proxy needs to start is checked before the running one is stopped.
   const cfg = readConfig();
   try { readGateway(cfg.gatewayEnv); } catch (e) { die(e.message); }
   for (const f of [P.ca, P.leaf, P.key]) if (!fs.existsSync(f)) die(`${f} is missing; run: gwproxy.mjs setup`);
-  if (spawnSync(process.execPath, ['--check', scriptPath]).status !== 0) die('this script does not parse; the running service was left alone');
+  if (run(process.execPath, '--check', scriptPath).status !== 0) die('this script does not parse; the running service was left alone');
+  fs.mkdirSync(path.dirname(servicePath), { recursive: true });
+  if (mac) installLaunchd(domain); else installSystemd();
+}
+
+function installLaunchd(domain) {
   try { fs.closeSync(fs.openSync(logPath, 'a', 0o600)); fs.chmodSync(logPath, 0o600); } catch { /* launchd will create it */ }
-  spawnSync('launchctl', ['bootout', `${domain}/${LABEL}`], { stdio: 'ignore' });
+  run('launchctl', 'bootout', `${domain}/${LABEL}`);
   const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const env = process.env.GWPROXY_HOME ? `  <key>EnvironmentVariables</key>\n  <dict>\n    <key>GWPROXY_HOME</key>\n    <string>${esc(HOME)}</string>\n  </dict>\n` : '';
-  fs.mkdirSync(path.dirname(plistPath), { recursive: true });
-  fs.writeFileSync(plistPath, `<?xml version="1.0" encoding="UTF-8"?>
+  fs.writeFileSync(servicePath, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -390,9 +404,37 @@ ${env}</dict>
 `);
   // bootout is not instant; the name must be free before it can be loaded again.
   let r;
-  for (let i = 0; i < 20; i++) { r = spawnSync('launchctl', ['bootstrap', domain, plistPath], { encoding: 'utf8' }); if (r.status === 0) break; spawnSync('sleep', ['0.5']); }
+  for (let i = 0; i < 20; i++) { r = run('launchctl', 'bootstrap', domain, servicePath); if (r.status === 0) break; spawnSync('sleep', ['0.5']); }
   if (r.status !== 0) die(`launchctl could not load the service: ${(r.stderr || '').trim()}`);
-  console.log(`service installed: ${plistPath}\nlog: ${logPath}`);
+  console.log(`service installed: ${servicePath}\nlog: ${logPath}`);
+}
+
+function installSystemd() {
+  // Without a user service manager (some containers, some remote logins) there is nothing to install into.
+  if (run('systemctl', '--user', 'show-environment').status !== 0) die(`systemd has no user service manager in this session, so no service was installed. Keep "node ${scriptPath} serve" running yourself, then run "node ${scriptPath} settings enable"`);
+  // One word of a unit file: quoted, with systemd's own special characters made literal.
+  const word = (s) => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%').replace(/\$/g, '$$$$')}"`;
+  const env = process.env.GWPROXY_HOME ? `Environment=${word(`GWPROXY_HOME=${HOME}`)}\n` : '';
+  fs.writeFileSync(servicePath, `[Unit]
+Description=gwproxy: Claude Code model calls to a gateway
+After=network-online.target
+
+[Service]
+ExecStart=${word(process.execPath)} ${word(scriptPath)} serve
+Restart=always
+RestartSec=2
+UMask=0077
+${env}
+[Install]
+WantedBy=default.target
+`);
+  for (const args of [['daemon-reload'], ['enable', `${NAME}.service`], ['restart', `${NAME}.service`]]) {
+    const r = run('systemctl', '--user', ...args);
+    if (r.status !== 0) die(`systemctl --user ${args.join(' ')} failed: ${(r.stderr || '').trim()}`);
+  }
+  console.log(`service installed: ${servicePath}\nlog: journalctl --user -u ${NAME}`);
+  const linger = run('loginctl', 'show-user', os.userInfo().username, '-p', 'Linger').stdout || '';
+  if (!linger.includes('Linger=yes')) console.log(`note: it runs while you are logged in. To keep it running after you log out, and start it at boot: loginctl enable-linger ${os.userInfo().username}`);
 }
 
 function settingsFile() { return path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'settings.json'); }
@@ -470,7 +512,7 @@ async function status() {
 // Everything, in order, on a machine that may or may not have it already. The proxy is run from a
 // copy of this file in the gwproxy folder, so the file it was installed from can move or be updated.
 async function install(args) {
-  if (process.platform !== 'darwin') die('install is only written for macOS so far; on Linux run setup and settings enable, and keep "gwproxy.mjs serve" running yourself');
+  if (!mac && process.platform !== 'linux') die('install is written for macOS and Linux only; elsewhere run setup and settings enable, and keep "gwproxy.mjs serve" running yourself');
   const opt = (name) => { const i = args.indexOf(name); return i < 0 ? undefined : args[i + 1]; };
   const installed = path.join(HOME, 'gwproxy.mjs');
   const kept = path.join(HOME, 'gateway.env');
@@ -495,7 +537,7 @@ async function install(args) {
   if (gatewayEnv !== before.gatewayEnv || port !== before.port || ![P.ca, P.leaf, P.key].every((f) => fs.existsSync(f))) changed = true;
   self('setup', '--gateway-env', gatewayEnv, '--port', String(port));
   // The running proxy is only restarted when something it uses has changed.
-  if (changed || !fs.existsSync(plistPath) || !(await health(port))) self('service', 'install');
+  if (changed || !fs.existsSync(servicePath) || !(await health(port))) self('service', 'install');
   else console.log('the proxy is running and nothing changed; left as it is');
   self('settings', 'enable');
   for (let i = 0; i < 20 && !(await health(port, 500)); i++) spawnSync('sleep', ['0.5']);
@@ -505,7 +547,7 @@ async function install(args) {
 
 function uninstall() {
   if (fs.existsSync(P.config)) settings('disable');
-  if (process.platform === 'darwin') service('uninstall');
+  if (mac || process.platform === 'linux') service('uninstall');
   console.log(`${HOME} (configuration, the key file, certificates) was left in place; delete it to remove the rest`);
 }
 
